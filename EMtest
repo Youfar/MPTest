@@ -1,0 +1,480 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys,re,os,sys,random,math
+from optparse import OptionParser
+import logging
+#pkg_sources是干什么的
+from pkg_resources import resource_filename
+try:
+    import numpy
+except ImportError:
+    print >> sys.stderr, "No numpy module"
+
+try:
+    from pyfasta import Fasta
+except ImportError:
+    print >> sys.stderr, "No pyfasta module"
+
+random.seed(1234)
+
+#用logging模块来写log
+#没全看懂，不过就是写日志的
+def writelog(path):
+    logfhd = open(os.path.join(path, "log"),"w")
+
+    #配置logging日志
+    logging.basicConfig(level=20,
+                        format='%(levelname)-5s @ %(asctime)s: %(message)s ',
+                        datefmt='%a, %d %b %Y %H:%M:%S',
+                        stream=sys.stderr,
+                        filemode="w"
+                        )
+
+    error   = logging.critical        # function alias 函数别名
+    warn    = logging.warning
+
+    return logfhd
+
+def info(a,path):
+    logfhd = writelog(path)
+    logging.info(a)
+    logfhd.write(a+"\n")
+    logfhd.flush()
+
+
+def EM(READ):
+    """ EM algorithm. input is a set of reads of an interval, output is m1 and m2 and alpha """
+    #这个步骤是EM的第一次使用，主要用来求准确的alpha
+    #这个设定说明结果和m1, m2, alpha初始值关系不大
+    #这个算法根本没考虑，甲基化或者非甲基化的CpG site到底在short read的哪个位置
+    #原来的实现是字典，
+    m1 = random.random()
+    m2 = random.random() ## initial values of m1 and m2
+    alpha1 = random.random()
+
+    steps = 0 ## number of EM steps
+    while True:
+        nu1 = 0
+        de1 = 0
+        nu2 = 0
+        de2 = 0
+
+        nu_alpha = 0
+        for key in READ:
+            #一条短序列里面至少有一个CpG site
+            if READ[key]["All"] >= 1:
+                p1 = (m1**READ[key]["Methy"])*((1-m1)**(READ[key]["All"] - READ[key]["Methy"]))
+                p2 = (m2**READ[key]["Methy"])*((1-m2)**(READ[key]["All"] - READ[key]["Methy"]))
+                Q1 = alpha1*p1 / (alpha1*p1 + (1-alpha1)*p2)
+                Q2 = (1-alpha1)*p2 / (alpha1*p1 + (1-alpha1)*p2)
+                nu1 += Q1 * READ[key]["Methy"]
+                de1 += Q1 * READ[key]["All"]
+                nu2 += Q2 * READ[key]["Methy"]
+                de2 += Q2 * READ[key]["All"]
+
+                nu_alpha += Q1
+
+
+
+        #print de1
+        #print de2
+        #sys.exit(0)
+        if (de1*de2 ==0): ## invalid, return a random result
+            return (m1,m2,alpha1)
+            break
+
+        m1_new = nu1 / de1
+        m2_new = nu2 / de2
+
+        alpha1_new = nu_alpha/len(READ)
+
+        if (abs(m1_new - m1) < 0.01 and abs(m2_new - m2) < 0.01 and abs(alpha1_new - alpha1) < 0.01) or steps > 200: ## num of steps <= 200
+                if (abs(m1_new - m1) < 0.01 and abs(m2_new - m2) < 0.01 and abs(alpha1_new - alpha1) < 0.01):
+
+                    # alpha1 is the smaller one
+                    if (alpha1 > 0.5): # switch
+                        alpha1 = 1 - alpha1
+                        temp = m1
+                        m1 = m2
+                        m2 = temp
+                    return (m1,m2,alpha1)
+                    break
+                elif steps > 200:
+                    #print "m1,m2,alpha1 not converge in 200 steps by EM calculating!\n"
+
+                    # alpha1 is the smaller one
+                    if (alpha1 > 0.5): # switch
+                        alpha1 = 1 - alpha1
+                        temp = m1
+                        m1 = m2
+                        m2 = temp
+                    return (m1,m2,alpha1)
+                    break
+        m1 = m1_new
+        m2 = m2_new
+        alpha1 = alpha1_new
+        steps = steps + 1
+
+#def EM_with_alpha(READ, alpha1, m1_start, m2_start):
+
+def bootstrap(READ, repeated_times):
+    """
+    其实就是用bootstrap反复求qualifying bins里面M1, M2, alpha1的方差
+    可以弄出简易的结果
+    改之后有几个语句细节没看
+    :param READ:
+    :param repeated_times:
+    :return:
+    """
+    ##表示每个bins中的short read的数目
+    num_of_read = len(READ)
+
+    ## M1,M2,alpha1是每次循环参数的数组，用来求方差的
+    M1 = [0]*repeated_times
+    M2 = [0]*repeated_times
+    alpha1 = [0]*repeated_times
+
+
+    for i in range(repeated_times):
+        ##SAMPLE_key表示从READ中选择short read的序号
+        SAMPLE_key = []
+        sample_times = min(1000, num_of_read)
+
+        for j in range(sample_times):
+            SAMPLE_key.append(random.randint(READ.keys(),1)[0])
+
+        SAMPLE = {}
+        for key in SAMPLE_key:
+            SAMPLE[key] = READ[key]
+        (m1_s, m2_s, al_s) = EM(SAMPLE)
+
+        alpha1[i] = al_s
+        M1[i] = m1_s
+        M2[i] = m2_s
+        del SAMPLE_key
+        del SAMPLE
+
+    var_alpha = numpy.var(alpha1)
+    var_M1 = numpy.var(M1)
+    var_M2 = numpy.var(M2)
+
+    return (var_alpha, var_M1, var_M2)
+
+def candidate_selection(READ):
+    #预选一下合适的READ群，需要READ中的sequence的methylevel或者都是甲基化或者都是非甲基化
+    #只有通过这个预选才能继续用EM算法
+    #参数怎么选成这样不太了解
+    N_methy = 0
+    N_unmethy = 0
+    N_read = len(READ)
+
+    upper = 0.8
+    lower = 0.2
+    effective_ratio = 0.9
+    minor_ratio = 0.05
+
+    #key是READ一堆序列的一条序列
+    for key in READ:
+        if READ[key]["All"] > 0:
+            methyLevel = READ[key]["Methy"]*1.0/READ[key]["All"]
+            if methyLevel >= upper:
+                N_methy += 1
+            elif methyLevel <= lower:
+                N_unmethy += 1
+
+    if (N_methy+N_unmethy)*1.0/N_read >= effective_ratio and N_methy*1.0/N_read > minor_ratio and N_unmethy*1.0/N_read > minor_ratio:
+        return "T"
+    else:
+        return "F"
+
+def get_mixingRatio(input_file, output_file, bin_length, coverage_cutoff, repeat_times, genome, cnv=False):
+    #第一次先求mixing ratio
+
+    #copy number variance 会影响结果，不过应该没有也可以，
+    #genome是reference genome
+    genome_file = genome
+    #pyfasta的必要步骤
+    f = Fasta(genome_file)
+
+    #input_file是sorted.bam file
+    IN = open(input_file, "r")
+    out = open(output_file, "w")
+
+    chr_current = "chr1"
+    bin_start = 0
+    READ = {}
+
+    for line in IN:
+        #这个地方需要看看
+        #先去掉所有不希望出现的空白，然后以\t划分成列表
+        #应该算是常见思路了
+        arr = line.strip().split("\t")
+        if arr[0].startwith("@") or not arr:
+            continue
+        if len(arr[5] != 3):
+            continue
+
+        readName = arr[0]
+        chrN = arr[2]
+        #len_read是怎么算的,90M表示90个比对上了
+        len_read = int(arr[5][:-1])
+        start = int(arr[3])
+        end = start + len_read
+
+        read = arr[9]
+        refseq = str.upper(f[chrN][start-1:start-1+len_read].__str__())
+        strand = arr[-1]
+
+        if chrN != chr_current or start - bin_start > bin_length: ## it is a new bin
+
+            # update the bin information
+
+            CGcount = f[chrN][start:start+bin_length].count("cg")+f[chrN][start:start+bin_length].count("CG")
+            #一个bin中需要至少有10个CpGs
+            if CGcount > 10: ## start a new bin
+                #20 * 300 / len_read
+                read_count_cutoff = coverage_cutoff * bin_length * 1.0/len_read
+                if len(READ) > read_count_cutoff:
+                    if candidate_selection(READ) == "T":
+                        (m1,m2,al) = EM(READ)
+                        (var_alpha,var_M1,var_M2) = bootstrap(READ,repeat_times)
+                        CGcount = f[chrN][bin_start:bin_start+bin_length].count("cg")+f[chrN][bin_start:bin_start+bin_length].count("CG")
+                        out.write ("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (chr_current,bin_start,bin_start+bin_length,m1,m2,al,var_alpha,var_M1,var_M2,len(READ),CGcount))
+
+
+                ## initialization
+                READ = {}
+                chr_current = chrN
+                bin_start = start
+
+                (n_me,n_all) = get_methyl(read,strand,refseq)
+
+                READ[readName] = {}
+                READ[readName]["Methy"] = n_me
+                READ[readName]["All"] = n_all
+            else:
+                continue
+
+        else: ## an old bin just add reads
+
+            (n_me,n_all) = get_methyl(read,strand,refseq)
+
+            READ[readName] = {}
+            READ[readName]["Methy"] = n_me
+            READ[readName]["All"] = n_all
+
+
+
+
+
+def get_methyl(read, strand, refseq):
+    #统计CpG的数量
+    #strand是bam file传入的
+    #n_me是甲基化的CpG数量，n_unme是非甲基化的CpG数量
+    #python切片[]后面的数位是不包含的，所以用refseq[n:n+2]只能切出来两位
+    n_me = 0
+    n_unme = 0
+
+    #Waston strand
+
+    #------ Watson strand ------#
+
+    if strand == "ZS:Z:++" or strand == "ZS:Z:+-":
+        for n in range(len(read) - 1):
+            if refseq[n:n+2] == "CG":
+                if read[n:n+2] == "CG":
+                    n_me += 1
+                elif read[n:n+2] == "TG":
+                    n_unme += 1
+                else:
+                    #print read[n:n+2]
+                    pass
+
+
+    #------ Crick strand ------#
+
+    elif strand == "ZS:Z:-+" or strand == "ZS:Z:--":
+        for n in range(len(read) - 1):
+            if refseq[n:n+2] == "CG":
+                if read[n:n+2] == "CG":
+                    n_me += 1
+                elif read[n:n+2] == "CA":
+                    n_unme += 1
+                else:
+                    #print read[n:n+2]
+                    pass
+
+    #print strand,"\n",refseq,"\n",read,"\n","methyl:",n_me,"\t","unmethyl:",n_unme
+    #raw_input("Next...")
+    return(n_me,n_me + n_unme)
+
+def one_For_Each_CGI(fn, cgi, inputFile, outputFile, species):
+    """ retain up to one bins for each CGI  """
+    #cgi表示CpG island bed file
+    #inputFile表示Informative_bins.bed
+    #outputFile表示OneForCGI文件
+    #每个CGI只取一个有最小标准差的bin,调用R脚本来处理
+    Rfile = open(os.path.join(fn, "one_For_Each_CGI.r"),"w")
+
+    Rfile.write("raw_file = '"+inputFile+"'\n")
+    Rfile.write("new_file = '"+outputFile+"'\n")
+    #某种读文件的形式
+    Rfile.write("dat = read.delim(raw_file)\n")
+    Rfile.write("dat_rm_CGI = c()\n")
+    Rfile.write("CGI = read.delim(\"%s\", header = F)\n" % cgi)
+    Rfile.write("print(head(CGI))\n")
+    Rfile.write("for (i in 1:nrow(CGI)) {\n")
+    Rfile.write("\tchr = CGI[i, 1]\n")
+    Rfile.write("\tstart = CGI[i, 2]\n")
+    Rfile.write("\tend = CGI[i, 3]\n")
+    Rfile.write("\tbins = dat[as.character(dat[, 1]) == chr & dat[, 2] >= start & dat[, 2] < end, ]\n")
+    Rfile.write("\tif (nrow(bins) > 0) {\n")
+    Rfile.write("\t\tdat_rm_CGI = rbind(dat_rm_CGI, bins[which.min(bins[, 'var_M1']), ])\n")
+    Rfile.write("\t}\n}\n\n")
+
+    Rfile.write("colnames(dat_rm_CGI) = colnames(dat)\n")
+    Rfile.write("write.table(dat_rm_CGI, file = new_file, sep = '\t',quote = F, row.names = F)\n")
+
+    Rfile.close()
+
+    os.system("Rscript %s " % os.path.join(fn, "one_For_Each_CGI.r"))
+
+
+
+def read_mixingRatio(fn,inputFile):
+    """ get mixing ratio from bed file """
+
+    Rfile = open(os.path.join(fn, "get_composition.r"),"w")
+    Rfile.write("dat = read.delim('"+inputFile+"')\n")
+    Rfile.write("dat2 = dat[dat[, 'var_M1'] <= 0.01,]\n")
+    Rfile.write("order = order(dat2[,'var_M1'],decreasing=F)\n")
+    Rfile.write("x = dat2[order[1:500],'alpha1']\n")
+
+    Rfile.write("factorx <- factor(cut(x, breaks=seq(0,0.5,0.01)))\n")
+    #factor x表示落在各个区间的个数
+    Rfile.write("xout <- as.data.frame(table(factorx))\n")
+    Rfile.write("peak = xout[which.max(xout[,'Freq']),'factorx']\n")
+    Rfile.write("peak = as.character(peak)\n")
+    Rfile.write("start = strsplit(substr(peak,2,nchar(peak)-1),',')[[1]][1]\n")
+    Rfile.write("end = strsplit(substr(peak,2,nchar(peak)-1),',')[[1]][2]\n")
+    Rfile.write("summit = mean(c(as.numeric(start),as.numeric(end)))\n")
+    #nrow表示行数，符合<0.01bins的数目
+    Rfile.write("write.table(c(summit,nrow(dat2)),file = '%s', row.names = F,col.names = F)\n\n" % os.path.join(fn, "alpha1.pred"))
+
+    Rfile.close()
+
+    os.system("Rscript %s" % os.path.join(fn,"get_composition.r"))
+
+#var1, var2, var3 = bootstrap(READ, 3)
+#print var1, var2, var3
+
+
+def main():
+    usage = "usage: python %prog <-f filename> <-g ref_genome> [...]"
+    description = "Select reads from two sam files"
+
+    op = OptionParser(version="%prog 0.1", description=description, usage=usage, add_help_option=False)
+
+    op.add_option("-f", "--filename",dest="filename", type="str",
+                  help="The file name of mixing tissue, pnly accept bam file currently")
+    op.add_option("-b","--BinLength",dest="BinLength",type="int",default="300",
+                  help="Length of each bin, default is 300")
+    op.add_option("-c","--coverage_cutoff",dest="coverage_cutoff",type="int",default="20",
+                  help="Lowest coverage cutoff in each bin, default is 20")
+    op.add_option("-s","--SamplingTimes",dest="SamplingTimes",type="int",default="50",
+                  help="sampling times for bootstraping in each bin, default is 50")
+    op.add_option("--species",dest="species",type="str",default = "hg19",
+                  help="the ref genome used for mapping, default is 'hg19'")
+    op.add_option("-g","--genome",dest="genome",type="str",
+                  help="the ref genome fasta used for building your genome index")
+    op.add_option("-i","--cpgi",dest="cgi",type="str",
+                  help="CpG island bed file")
+    op.add_option("--cnv",dest="cnv",action = "store_true", default=False,
+                  help="use cnv data or not, only available for hg19 now")
+    (options,args) = op.parse_args()
+
+    if not options.filename:
+        op.print_help()
+        sys.exit(1)
+
+    filename = options.filename
+    bin_length = options.BinLength
+    coverage_cutoff = options.coverage_cutoff
+    repeat_times = options.SamplingTimes
+    species = options.species
+    genome = options.genome
+    cgi = options.cgi
+    cnv = options.cnv
+
+    if not os.path.exists(cgi):
+        print >>sys.stderr, "Not found CpG island files"
+        sys.exit(1)
+
+    if not os.path.exists(genome):
+        print >>sys.stderr, "Not found fasta files"
+        sys.exit(1)
+
+    if not os.path.exists(filename):
+        print >>sys.stderr, "Not found bam files"
+        sys.exit(1)
+
+    fn = os.path.split(filename)[1].strip(".bam")
+
+
+    #-------- step 1: map to CGI and sort -------#
+    if not os.path.isdir(fn):
+        os.mkdir(fn)
+    path = fn
+
+ #   CMD_map_to_CGI = "samtools view -h -b -L "+resource_filename("methylpurify", "db/CGI_%s_slop1000.bed"%species) + " " + filename + " > "+ fn+".CGI.bam"
+    if not os.path.exists(os.path.join(fn, fn+".CGI.bam")):
+        #-h 表示 Include the header in the output.
+        #-b 表示 Output in the BAM format.
+        #-L 表示 Only output alignments overlapping the input BED FILE [null].
+        CMD_map_to_CGI = "samtools view -h -b -L "+ cgi + " " + filename + " > "+ os.path.join(fn, fn+".CGI.bam")
+        info("Runing: %s" % CMD_map_to_CGI, path)
+        os.system(CMD_map_to_CGI)
+
+    if not os.path.exists(os.path.join(fn, fn+".CGI.sorted.bam")):
+        CMD_sort = "samtools sort "+ os.path.join(fn, fn + ".CGI.bam") + " " +" " + os.path.join(fn, fn+".CGI.sorted")
+        info("Runing: %s" % CMD_sort, path)
+        os.system(CMD_sort)
+
+    if not os.path.exists(os.path.join(fn, fn+".CGI.sorted.sam")):
+        CMD_bam_to_sam = "samtools view -h "+ os.path.join(fn, fn+".CGI.sorted.bam") + " > " + os.path.join(fn, fn+".CGI.sorted.sam")
+        info("Running: %s" % CMD_bam_to_sam,path)
+        os.system(CMD_bam_to_sam)
+
+    #-------- step 2: get mixingRatio -----------#
+    Input = os.path.join(fn, fn+".CGI.sorted.sam")
+    Output_mixRatio = os.path.join(fn, fn+"Informative_bins.bed")
+
+    if not os.path.exists(os.path.join(fn, fn+"Informative_bins.bed")):
+        info("Running get_mixingRatio:\n Input:%s\nOutput:%s\nBin_length:%s\nCoverage:%s\nRepeat_times:%s\nGenome:%s\n" % (Input,Output_mixRatio,bin_length,coverage_cutoff,repeat_times,species), path)
+        get_mixingRatio(Input,Output_mixRatio,bin_length,coverage_cutoff,repeat_times,genome,cnv)
+
+    # retain only up to one informative bin for each CGI
+    one_For_Each_CGI(fn, cgi, Output_mixRatio, Output_mixRatio+".OneForCGI",species)
+#
+    # reading the mixing ratio
+    read_mixingRatio(fn, Output_mixRatio+".OneForCGI")
+    MixFile = open(os.path.join(fn, "alpha1.pred"),"r")
+    MixRatio = float(MixFile.readline().strip())
+    NumInfoBins = float(MixFile.readline().strip())
+
+    print "The predicted mixing ratio is: ",MixRatio
+    print "The number of informative bins is: ",NumInfoBins
+    if NumInfoBins < 400:
+        print "The number of informative bins is less than 400, too less for the prediction of mixing ratio, continue"
+#        sys.exit(0)
+    elif NumInfoBins >= 400 and NumInfoBins < 500:
+        print "Warning: the number of informative bins is less than 500, not sufficient to get a reliable estimation!"
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.stderr.write("User interrupt\n")
+        sys.exit(0)
